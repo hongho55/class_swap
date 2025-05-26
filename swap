@@ -1235,7 +1235,7 @@ function updateHBCwithAverages() {
     ui.alert(CONSTANTS.MESSAGES.HBC_SHEET_NOT_FOUND);
     return;
   }
-
+  const gap = 1; // 분반 시트 생성 시 사용된 gap 값과 동일하게 설정
   const columnA = shHBC.getRange("A:A").getValues().flat();
   let miRow = null; // "미배정" 레이블이 있는 행 (1-based)
   for (let r = 0; r < columnA.length; r++) {
