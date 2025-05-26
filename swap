@@ -842,7 +842,7 @@ function writeResultSheet(ss, classes, config){
 
   if (statsHeader.length > 0) {
     sh.setColumnWidths(1, statsHeader.length, 70); // 너비 살짝 증가
-    sh.autoResizeColumns(1, statsHeader.length); // 자동 크기 조절 추가
+    // sh.autoResizeColumns(1, statsHeader.length); // 자동 크기 조절 추가
   }
 }
 
@@ -944,7 +944,7 @@ function writeResultSheet2(ss, classes, config) {
   const lastCol = Math.max(headers.length, (config.criteriaNames.length > 0 ? config.criteriaNames.length + 1: headers.length));
   if (lastCol > 0) {
     sh.setColumnWidths(1, lastCol, 70); // 너비 살짝 증가
-    sh.autoResizeColumns(1, lastCol); // 자동 크기 조절 추가
+    // sh.autoResizeColumns(1, lastCol); // 자동 크기 조절 추가
   }
   if (row > 1) sh.autoResizeRows(1, row);
 }
@@ -1183,7 +1183,7 @@ function createHorizontalBlockSheet_MenTopWomenBottom(ss, classes, currentClassC
   });
   
   if (statsHeader.length > 0) {
-    sh.autoResizeColumns(avgTableStartCol, statsHeader.length);
+    // sh.autoResizeColumns(avgTableStartCol, statsHeader.length);
   }
   sh.autoResizeRows(avgTableRowStart, statsRow - avgTableRowStart + 1);
 }
@@ -1218,7 +1218,7 @@ function writeOriginalClassStatsInHBCSheet(sh, config, startRow) {
     currentRow++;
   });
   if (classNames.length > 0) {
-      sh.autoResizeColumns(headerColStart, 4);
+      // sh.autoResizeColumns(headerColStart, 4);
       sh.autoResizeRows(startRow, classNames.length + 1);
   }
 }
@@ -1448,7 +1448,7 @@ function updateHBCwithAverages() {
   });
   
   if (statsHeader.length > 0) {
-    shHBC.autoResizeColumns(avgTableStartCol, statsHeader.length);
+    // shHBC.autoResizeColumns(avgTableStartCol, statsHeader.length);
   }
   shHBC.autoResizeRows(avgTableStartRow - (classes.length +1), classes.length +2);
 
