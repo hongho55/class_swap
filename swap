@@ -1,0 +1,1555 @@
+/*******************************************************
+ * 1) 메뉴에 "분반 기능" 추가
+ *******************************************************/
+function onOpen() {
+  const uia = SpreadsheetApp.getUi();
+  uia.createMenu("분반 기능")
+    .addItem("분반 실행", "runSimulatedAnnealing")
+    .addItem("갱신하기(재편성결과 + 평균)", "updateHBCwithAverages")
+    .addToUi();
+}
+
+/*******************************************************
+ * 3) 시뮬레이티드 어닐링 메인 함수
+ *******************************************************/
+function runSimulatedAnnealing() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1. 설정 읽기
+  const config = readConfig(ss);
+  if (!config) {
+    SpreadsheetApp.getUi().alert("config 시트를 찾을 수 없거나, 설정값이 잘못되었습니다.");
+    return;
+  }
+
+  // 2. 기준 복사 및 초기화
+  copyCriteriaToClassSheets(ss, config);
+
+  // 3. 학생 로드
+  if (!config.included || !config.included.length) {
+    SpreadsheetApp.getUi().alert("배정 대상 학생(비고: 전학/특수 제외)이 없습니다.");
+    return;
+  }
+
+  // 4. 초기 균등 분배(배정 대상 학생들만)
+  let currentSolution = initializeClasses(config.included, config);
+  let currentCost = calculateCost(currentSolution, config);
+
+  // 5. 시뮬레이티드 어닐링 파라미터
+  let temperature = config.temperature;       // 시작 온도
+  const coolingRate = config.coolingRate;    // 온도 감소 속도
+  const minTemperature = config.minTemperature;     // 종료 조건: 최소 온도
+  const maxIterations = config.maxIterations; // 최대 반복 횟수
+  let iterations = 0;
+
+  while (temperature > minTemperature && iterations < maxIterations) {
+    iterations++;
+
+    // 6. 무작위로 두 학생을 교환하여 이웃 해 생성
+    let neighbor = swapTwoStudents(currentSolution, config);
+    if (!neighbor) continue;
+
+    // 7. 비용 계산
+    let newCost = calculateCost(neighbor, config);
+
+    // 8. 비용 비교 → 더 좋거나, 확률적으로 수용 가능하면 갱신
+    if (newCost < currentCost || Math.random() < Math.exp((currentCost - newCost) / temperature)) {
+      currentSolution = neighbor;
+      currentCost = newCost;
+    }
+
+    // 9. 온도 감소
+    temperature *= coolingRate;
+
+    // 10. 로그 (선택)
+    if (iterations % 10000 === 0) {
+      Logger.log(`Iteration: ${iterations} | Temperature: ${temperature.toFixed(2)} | Cost: ${currentCost.toFixed(4)}`);
+    }
+  }
+
+  // 11. 결과 기록
+  writeResultSheet(ss, currentSolution, config);
+  // 11-2. 결과 기록 ("재편성 결과_2")
+  writeResultSheet2(ss, currentSolution, config);
+
+  // 12. 분반 시트 생성
+  createHorizontalBlockSheet_MenTopWomenBottom(ss, currentSolution, config.currentClassCount, config);
+}
+
+/*******************************************************
+ * 4) 'config_class'와 'config_weight' 시트에서 설정값 읽기
+ *******************************************************/
+function readConfig(ss) {
+  // 1. config_class 시트 읽기
+  const configClassSheet = ss.getSheetByName("config_class");
+  if (!configClassSheet) {
+    SpreadsheetApp.getUi().alert("config_class 시트를 찾을 수 없습니다.");
+    return null;
+  }
+
+  const currentClassCount = Number(configClassSheet.getRange("A1").getValue()) || 4;
+  const targetClassCount = Number(configClassSheet.getRange("A2").getValue()) || 4;
+  const criteriaNamesRange = configClassSheet.getRange("D2:G2"); // 기준 이름 영역
+  const criteriaNames = criteriaNamesRange.getValues()[0]
+    .map(name => String(name).trim())
+    .filter(name => name !== "");
+  const numCriteria = criteriaNames.length;
+
+  // 충돌 학생 그룹 읽기 (추가)
+  const conflictGroups = readConflictGroups(configClassSheet, targetClassCount);
+
+  // 2. config_weight 시트 읽기
+  const configWeightSheet = ss.getSheetByName("config_weight");
+  if (!configWeightSheet) {
+    SpreadsheetApp.getUi().alert("config_weight 시트를 찾을 수 없습니다.");
+    return null;
+  }
+
+  const vals = configWeightSheet.getRange("B1:B15").getValues();
+
+  const alphaGender = Number(vals[2]) || 100;
+  const alphaPrevClassGender = Number(vals[3]) || 100;
+  const alphaOldClass = Number(vals[4]) || 100;
+  const alphaSize = Number(vals[5]) || 50;
+
+  const alphaCriteria = [];
+  for (let i = 0; i < numCriteria; i++) {
+    const alphaVal = Number(vals[6 + i]) || 10;
+    alphaCriteria.push(alphaVal);
+  }
+
+  const temperature = Number(vals[10]) || 1000;
+  const coolingRate = Number(vals[11]) || 0.9;
+  const minTemperature = Number(vals[12]) || 0.1;
+  const maxIterations = Number(vals[13]) || 50000;
+  const weightDistribution = Number(vals[14]) || 0.5;
+  const weightScores = Number(vals[15]) || 0.5;
+
+  // 3. 전체 학생 로드 및 필터링
+  const allStudents = loadAllStudents(ss, currentClassCount, numCriteria);
+  const excluded = allStudents.filter(s => {
+    if (!s.remark) return false;
+    const r = s.remark.trim().toLowerCase();
+    return r.includes("전학") || r.includes("특수");
+  });
+  const included = allStudents.filter(s => !excluded.includes(s));
+
+  // 4. 목표 및 동적 타겟 계산
+  const totalStudents = included.length;
+  const classSizeLimits = calculateClassSizeLimits(targetClassCount, totalStudents);
+  const targetGenderCounts = getTargetGenderCounts(included, targetClassCount);
+  const targetOldClassCounts = getTargetOldClassCounts(included, targetClassCount);
+  const dynamicTargets = calculateDynamicTargets(included, criteriaNames);
+
+  // 5. 설정 객체 반환
+  return {
+    currentClassCount,
+    targetClassCount,
+    criteriaNames,
+    alphaGender,
+    alphaPrevClassGender,
+    alphaOldClass,
+    alphaSize,
+    alphaCriteria,
+    temperature,
+    coolingRate,
+    minTemperature,
+    maxIterations,
+    weightDistribution,
+    weightScores,
+    dynamicTargets,
+    allStudents,
+    included,
+    excluded,
+    classSizeLimits,
+    targetGenderCounts,
+    targetOldClassCounts,
+    conflictGroups // 충돌 학생 그룹 추가
+  };
+}
+
+// 충돌 학생 그룹 읽기 함수 (추가)
+function readConflictGroups(configClassSheet, targetClassCount) {
+  const groups = [];
+  let row = 9; // A9, B9, C9, D9 부터 시작
+  while (true) {
+    const group = [];
+    for (let col = 1; col <= targetClassCount; col++) { // A, B, C, D 열 (최대 targetClassCount 만큼)
+      const cellValue = configClassSheet.getRange(row, col).getValue();
+      if (cellValue) {
+        group.push(String(cellValue).trim());
+      }
+    }
+    if (group.length === 0) {
+      break; // 빈 그룹을 만나면 종료
+    }
+    groups.push(group);
+    row++;
+  }
+  return groups;
+}
+
+function calculateDynamicTargets(included, criteriaNames) {
+  const targets = {};
+  criteriaNames.forEach((metric, idx) => {
+    const sum = included.reduce((acc, student) => acc + (student.criteriaValues[idx] || 0), 0);
+    targets[metric] = included.length ? sum / included.length : 0;
+  });
+  return targets;
+}
+
+/*******************************************************
+ * 5) 기준 복사 및 초기화 함수
+ *    - 'config_class' 시트에서 기준을 읽어 각 반 시트에 복사합니다.
+ *    - 기존 반 시트에 기준이 없거나, 기준 수가 변경되면 업데이트합니다.
+ *******************************************************/
+function copyCriteriaToClassSheets(ss, config) {
+  const { criteriaNames } = config;
+  if (criteriaNames.length === 0) {
+    SpreadsheetApp.getUi().alert("config_class 시트에 기준 이름이 없습니다.");
+    return;
+  }
+
+  for (let i = 1; i <= config.currentClassCount; i++) {
+    const sheetName = i + "반";
+    let sh = ss.getSheetByName(sheetName);
+    if (!sh) {
+      sh = ss.insertSheet(sheetName);
+    }
+
+    // 기준 헤더를 D1 이후에 설정
+    const headerRange = sh.getRange(1, 4, 1, criteriaNames.length);
+    headerRange.setValues([criteriaNames]);
+    headerRange.setFontWeight("bold");
+    headerRange.setHorizontalAlignment("center");
+
+    // 비고 헤더는 마지막 기준 다음 열에 설정
+    const remarkCol = 4 + criteriaNames.length;
+    sh.getRange(1, remarkCol).setValue("비고").setFontWeight("bold").setHorizontalAlignment("center");
+  }
+}
+
+/*******************************************************
+ * 6) 반 시트("1반"~n반)에서 학생 로드 (수정됨: 동적 기준 지원, 메모-옛반 정보 항상 활용)
+ *    [A=번호, B=이름, C=성별, D~Gn=기준, H=비고]
+ *******************************************************/
+function loadAllStudents(ss, currentClassCount, criteriaCount) { // useMemoOldClass 제거
+  const all = [];
+  const uniqueSet = new Set();
+
+  for (let i = 1; i <= currentClassCount; i++) {
+    const sheetName = i + "반";
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) continue;
+
+    const rangeVals = sh.getDataRange().getValues();
+    if (rangeVals.length < 2) continue; // 데이터 없음
+
+    const dataRows = rangeVals.slice(1);
+    dataRows.forEach(row => {
+      if (!row[0] || !row[1]) return; // 번호나 이름이 없으면 스킵
+      const number = row[0];
+      const name   = row[1];
+      const gender = String(row[2]||"").trim() === "남" ? "남" : "여";
+
+      // 기준1~n (동적 기준 수)
+      const criteriaValues = row.slice(3, 3 + criteriaCount).map(v => Number(v) || 0); // D~Dn
+
+      // H열=비고
+      const remark = String(row[3 + criteriaCount] || "").trim();
+
+      // (원본 반) sheetName = "1반"
+      const prevClass = sheetName;
+
+      // (중복 방지) key = (이름 + prevClass) 등
+      const uniqueKey = name + "_" + prevClass;
+      if (!uniqueSet.has(uniqueKey)) {
+        uniqueSet.add(uniqueKey);
+
+        all.push({
+          number,
+          name,
+          gender,
+          prevClass,
+          criteriaValues, // [기준1, 기준2, ...]
+          remark  // 비고
+        });
+      }
+    });
+  }
+  return all;
+}
+
+/*******************************************************
+ * 7) 남/여 수 목표 (각 새반)
+ *******************************************************/
+function getTargetGenderCounts(students, targetClassCount) {
+  const totalMale = students.filter(s => s.gender === "남").length;
+  const totalFemale = students.filter(s => s.gender === "여").length;
+
+  const baseMale = Math.floor(totalMale / targetClassCount);
+  const remMale  = totalMale % targetClassCount;
+
+  const baseFemale = Math.floor(totalFemale / targetClassCount);
+  const remFemale  = totalFemale % targetClassCount;
+
+  const arr = [];
+  for (let i = 0; i < targetClassCount; i++) {
+    const m = baseMale + (i < remMale ? 1 : 0);
+    const f = baseFemale + (i < remFemale ? 1 : 0);
+    arr.push({ "남": m, "여": f });
+  }
+  return arr;
+}
+
+/*******************************************************
+ * 8) 옛반 분배 목표
+ *******************************************************/
+function getTargetOldClassCounts(students, targetClassCount) {
+  const oldClasses = {};
+  students.forEach(s => {
+    oldClasses[s.prevClass] = (oldClasses[s.prevClass] || 0) + 1;
+  });
+
+  const result = {};
+  for (let oldC in oldClasses) {
+    if (oldClasses.hasOwnProperty(oldC)) {
+      const total = oldClasses[oldC];
+      const base = Math.floor(total / targetClassCount);
+      const rem  = total % targetClassCount;
+      const arr = [];
+      for (let i = 0; i < targetClassCount; i++) {
+        arr.push(base + (i < rem ? 1 : 0));
+      }
+      result[oldC] = arr;
+    }
+  }
+  return result;
+}
+
+/*******************************************************
+ * 9) 인원수 제한 계산 (균등 ±1)
+ *******************************************************/
+function calculateClassSizeLimits(targetClassCount, totalStudents) {
+  const base = Math.floor(totalStudents / targetClassCount);
+  const remainder = totalStudents % targetClassCount;
+  const limits = [];
+  for (let i = 0; i < targetClassCount; i++) {
+    if (i < remainder) limits.push(base + 1);
+    else limits.push(base);
+  }
+  return limits;
+}
+
+/*******************************************************
+ * 10) 초기 분배: 옛반별 (남/여) 분리 → (남 → 여) 순서로
+ * 1명씩 뽑아, "현재 인원이 가장 적은 새반"에 배정
+ *******************************************************/
+function initializeClasses(included, config) {
+  const K = config.targetClassCount;
+  const classSizeLimits = config.classSizeLimits;
+  const classes = Array.from({length: K}, () => []);
+
+  // "만나면 안되는 학생" 그룹 처리 (추가)
+  const conflictGroups = config.conflictGroups;
+
+  // 옛반별 및 성별로 분류
+  const oldGenderMap = {};
+  included.forEach(s => {
+    const oc = s.prevClass;
+    const gender = s.gender;
+    if(!oldGenderMap[oc]) oldGenderMap[oc] = { "남": [], "여": [] };
+    oldGenderMap[oc][gender].push(s);
+  });
+
+  // 각 옛반별 성별 학생들을 균등하게 분배
+  Object.keys(oldGenderMap).forEach(oc => {
+    ["남", "여"].forEach(gender => {
+      shuffleArray(oldGenderMap[oc][gender]);
+
+      // "만나면 안되는 학생" 그룹 확인 및 처리 (추가)
+      oldGenderMap[oc][gender].forEach(st => {
+        let isConflicted = false;
+        for (let group of conflictGroups) {
+          if (group.includes(st.name + "_" + st.prevClass)) {
+            // 충돌 그룹에 속한 학생
+            isConflicted = true;
+            let assigned = false;
+            for (let i = 0; i < K; i++) {
+              let canAssign = true;
+              for (let otherStudent of classes[i]) {
+                if (group.includes(otherStudent.name + "_" + otherStudent.prevClass)) {
+                  canAssign = false;
+                  break;
+                }
+              }
+              if (canAssign) {
+                classes[i].push(st);
+                assigned = true;
+                break;
+              }
+            }
+            if (!assigned) {
+              // 모든 반에 충돌하는 학생이 있어서 할당할 수 없는 경우
+              // 일단 임의의 반에 할당 (비용 함수에서 처리)
+              let idx = findMinClassIndexWithLimit(classes, classSizeLimits);
+              if (idx !== -1) {
+                classes[idx].push(st);
+              }
+            }
+            break;
+          }
+        }
+        if (!isConflicted) {
+          // 충돌 그룹에 속하지 않은 학생은 기존 방식으로 할당
+          let idx = findMinClassIndexWithLimit(classes, classSizeLimits);
+          if (idx !== -1) {
+            classes[idx].push(st);
+          }
+        }
+      });
+    });
+  });
+
+  // 로깅: 각 새 반의 인원수 및 남녀 수 확인
+  classes.forEach((cls, idx) => {
+    const men = cls.filter(s => s.gender === "남").length;
+    const women = cls.filter(s => s.gender === "여").length;
+    Logger.log(`새 ${idx + 1}반 인원수: ${cls.length} / 남: ${men}, 여: ${women} / 목표: 남: ${config.targetGenderCounts[idx].남}, 여: ${config.targetGenderCounts[idx].여}`);
+  });
+
+  return classes;
+}
+
+function findMinClassIndexWithLimit(classes, classSizeLimits) {
+  let minIndex = -1;
+  let minSize = Infinity;
+  for(let i = 0; i < classes.length; i++){
+    if(classes[i].length < minSize && classes[i].length < classSizeLimits[i]){
+      minSize = classes[i].length;
+      minIndex = i;
+    }
+  }
+  return minIndex;
+}
+
+/*******************************************************
+ * 11) 배열 무작위 섞기
+ *******************************************************/
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i>0; i--) {
+    const j = Math.floor(Math.random()* (i+1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+/*******************************************************
+ * 12) 두 학생 교환 (SA 이웃생성)
+ *******************************************************/
+function swapTwoStudents(classes, config){
+  const K = classes.length;
+  if(K < 2) return null;
+  let attempts = 0;
+  while(attempts < 200){
+    const classA = Math.floor(Math.random() * K);
+    const classB = Math.floor(Math.random() * K);
+    if(classA === classB) {
+      attempts++;
+      continue;
+    }
+    const clsA = classes[classA];
+    const clsB = classes[classB];
+    if(clsA.length === 0 || clsB.length === 0){
+      attempts++;
+      continue;
+    }
+    const idxA = Math.floor(Math.random() * clsA.length);
+    const idxB = Math.floor(Math.random() * clsB.length);
+    const studentA = clsA[idxA];
+    const studentB = clsB[idxB];
+
+    // "만나면 안되는 학생" 제약 조건 확인 (추가)
+    let canSwap = true;
+    for (let group of config.conflictGroups) {
+      if (group.includes(studentA.name + "_" + studentA.prevClass)) {
+        for (let student of clsB) {
+          if (student !== studentB && group.includes(student.name + "_" + student.prevClass)) {
+            canSwap = false;
+            break;
+          }
+        }
+      }
+      if (group.includes(studentB.name + "_" + studentB.prevClass)) {
+        for (let student of clsA) {
+          if (student !== studentA && group.includes(student.name + "_" + student.prevClass)) {
+            canSwap = false;
+            break;
+          }
+        }
+      }
+      if (!canSwap) break;
+    }
+
+    if (canSwap) {
+      // 교환 후의 분배를 평가하여 비용이 줄어들거나 동일하면 교환
+      const newClasses = classes.map(cls => [...cls]);
+      newClasses[classA][idxA] = studentB;
+      newClasses[classB][idxB] = studentA;
+
+      const newCost = calculateCost(newClasses, config);
+      const currentCost = calculateCost(classes, config);
+
+      if (newCost <= currentCost) {
+        return newClasses;
+      }
+    }
+
+    attempts++;
+  }
+  return null;
+}
+
+/*******************************************************
+ * 13) 비용 함수 (동적 기준 지원)
+ *******************************************************/
+function calculateCost(classes, config) {
+  const {
+    alphaGender, alphaOldClass, alphaSize, alphaPrevClassGender,
+    criteriaNames, alphaCriteria,
+    weightDistribution, weightScores
+  } = config;
+
+  let costDistribution = 0;
+  let costScores = 0;
+
+  // 1. 인원수 균형 비용 (기존 코드 유지)
+  if (alphaSize > 0) {
+    costDistribution += alphaSize * getSizeVariance(classes, config.classSizeLimits);
+  }
+
+  // 2. 성별 균형 비용 (기존 코드 유지)
+  if (alphaGender > 0) {
+    const targetGenderCounts = config.targetGenderCounts;
+    classes.forEach((cls, idx) => {
+      const men = cls.filter(s => s.gender === "남").length;
+      const women = cls.filter(s => s.gender === "여").length;
+      costDistribution += alphaGender * Math.abs(men - targetGenderCounts[idx].남);
+      costDistribution += alphaGender * Math.abs(women - targetGenderCounts[idx].여);
+    });
+  }
+
+  // 3. **[수정됨]** 이전 반 분포 균등성 비용
+  if (alphaOldClass > 0) {
+    costDistribution += calculateImprovedOldClassImbalanceCost(classes, config, alphaOldClass); // 개선된 비용 함수 사용
+  }
+
+  // 4. 이전 반 - 성별 균형 비용 (기존 코드 유지)
+  if (alphaPrevClassGender > 0) {
+    costDistribution += calculatePrevClassGenderImbalanceCost(classes, config, alphaPrevClassGender);
+  }
+
+  // 5. 점수 지표 균형 비용 (기존 코드 유지)
+  if (criteriaNames.length > 0) {
+    criteriaNames.forEach((metric, idx) => {
+      const alpha = alphaCriteria[idx];
+      if (alpha > 0) {
+        const target = config.dynamicTargets[metric];
+        costScores += alpha * getAverageVariance(classes, metric, target, criteriaNames);
+      }
+    });
+  }
+
+  // "만나면 안되는 학생" 비용 추가
+  costDistribution += calculateConflictCost(classes, config);
+
+  // 총 비용 계산 (기존 코드 유지)
+  const totalCost = (weightDistribution * costDistribution) + (weightScores * costScores);
+
+  return totalCost;
+}
+
+// "만나면 안되는 학생" 비용 계산 함수 (추가)
+function calculateConflictCost(classes, config) {
+  let cost = 0;
+  const conflictGroups = config.conflictGroups;
+  classes.forEach(cls => {
+    for (let group of conflictGroups) {
+      let conflictCount = 0;
+      cls.forEach(student => {
+        if (group.includes(student.name + "_" + student.prevClass)) {
+          conflictCount++;
+        }
+      });
+      if (conflictCount > 1) {
+        cost += conflictCount * (conflictCount - 1) / 2; // 조합 공식 nC2 = n*(n-1)/2
+      }
+    }
+  });
+  return cost;
+}
+
+/**
+ * 특정 지표에 대한 각 클래스의 평균과 목표 값의 절대 차이를 계산하여 반환합니다.
+ * @param {Array<Array<Object>>} classes - 각 클래스의 학생 목록 배열.
+ * @param {string} metric - 비교할 지표의 이름 (예: "시끄러운", "곤란도").
+ * @param {number} target - 목표 평균 값.
+ * @param {Array<string>} criteriaNames - 기준 이름 배열.
+ * @returns {number} - 모든 클래스에서의 평균 차이의 합.
+ */
+function getAverageVariance(classes, metric, target, criteriaNames) {
+  let variance = 0;
+
+  classes.forEach(cls => {
+    if (cls.length === 0) return; // 빈 클래스는 무시
+
+    // 특정 지표의 평균 계산
+    const metricIndex = criteriaNames.indexOf(metric);
+    if (metricIndex === -1) return; // 지표 이름이 일치하지 않으면 무시
+
+    let sum = cls.reduce((acc, student) => acc + (student.criteriaValues[metricIndex] || 0), 0);
+    let avg = cls.length ? (sum / cls.length) : 0;
+
+    // 평균과 목표 값의 절대 차이 계산
+    variance += Math.abs(avg - target);
+  });
+
+  return variance;
+}
+
+/*******************************************************
+ * 14) "재편성 결과" 시트 쓰기 (동적 기준 지원)
+ *******************************************************/
+function writeResultSheet(ss, classes, config){
+  let sh = ss.getSheetByName("재편성 결과_새 반 정렬");
+  if(sh) { // 시트가 이미 있다면
+    // 시트의 데이터 영역 전체를 clear() 로 지워서 내용과 서식 모두 초기화! ✨
+    sh.getDataRange().clear();
+  } else {
+    let activeSheet = ss.getActiveSheet(); // 현재 활성 시트 저장
+    sh = ss.insertSheet("재편성 결과_새 반 정렬"); // 새 시트 생성! ✨ (이 시트가 잠시 활성 시트가 됨)
+    ss.setActiveSheet(activeSheet); // 다시 원래 활성 시트로 돌아감
+  }
+
+  const { excluded, criteriaNames } = config;
+
+  let rowStart = 1;
+
+  classes.forEach((cls, idx) => {
+    const cname = `새 ${idx+1}반`;
+    sh.getRange(rowStart, 1).setValue(cname).setFontWeight("bold");
+    rowStart++;
+
+    // 동적 기준명을 포함한 헤더 생성
+    let header = ["번호", "이름", "기존 반", "성별"];
+    header = header.concat(criteriaNames);
+    header.push("비고");
+
+    sh.getRange(rowStart, 1, 1, header.length).setValues([header]);
+    sh.getRange(rowStart, 1, 1, header.length).setFontWeight("bold");
+    rowStart++;
+
+    // 오름차순 정렬
+    cls.sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+
+    // 데이터 준비
+    const data = cls.map(s => [
+      s.number,
+      s.name,
+      s.prevClass,
+      s.gender,
+      ...s.criteriaValues,
+      s.remark || ""
+    ]);
+
+    if(data.length){
+      sh.getRange(rowStart, 1, data.length, header.length).setValues(data);
+      rowStart += data.length;
+    }
+    rowStart++;
+  });
+
+  // 미배정 학생 처리
+  if(excluded && excluded.length){
+    sh.getRange(rowStart, 1).setValue("미배정").setFontWeight("bold");
+    rowStart++;
+
+    // 미배정 헤더 생성
+    let exHeader = ["번호", "이름", "기존 반", "성별"];
+    exHeader = exHeader.concat(criteriaNames);
+    exHeader.push("비고");
+
+    sh.getRange(rowStart, 1, 1, exHeader.length).setValues([exHeader]);
+    sh.getRange(rowStart, 1, 1, exHeader.length).setFontWeight("bold");
+    rowStart++;
+
+    // 미배정 데이터 준비
+    excluded.sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+    const exData = excluded.map(s => [
+      s.number,
+      s.name,
+      s.prevClass,
+      s.gender,
+      ...s.criteriaValues,
+      s.remark || ""
+    ]);
+
+    sh.getRange(rowStart, 1, exData.length, exHeader.length).setValues(exData);
+    rowStart += exData.length;
+    rowStart++;
+  }
+
+  // 반별 통계 작성
+  sh.getRange(rowStart, 1).setValue("반별 통계").setFontWeight("bold");
+  rowStart++;
+
+  // 기본 통계 헤더 생성
+  let statsHeader = [
+    "반",
+    "총원",
+    "남",
+    "여",
+    ...criteriaNames.map(name => `${name}`)
+  ];
+
+  // 최대 비고 수 계산 (예: 최대 10개까지 표시)
+  let maxRemarks = 0;
+  classes.forEach(cls => {
+    const remarksCount = cls.map(s => s.remark).filter(r => r).length;
+    if (remarksCount > maxRemarks) maxRemarks = remarksCount;
+  });
+  maxRemarks = Math.min(maxRemarks, 10); // 필요에 따라 조정 가능
+
+  for (let i = 1; i <= maxRemarks; i++) {
+    statsHeader.push(`비고${i}`);
+  }
+
+  sh.getRange(rowStart, 1, 1, statsHeader.length).setValues([statsHeader]);
+  sh.getRange(rowStart, 1, 1, statsHeader.length).setFontWeight("bold");
+  rowStart++;
+
+  // 각 반의 통계 및 비고 리스트 작성
+  classes.forEach((cls, idx) => {
+    const total = cls.length;
+    const menCount = cls.filter(s => s.gender === "남").length;
+    const womenCount = cls.filter(s => s.gender === "여").length;
+
+    // 기준 평균 계산
+    const avgCriteria = criteriaNames.map((metric, i) => {
+      let sum = cls.reduce((acc, s) => acc + (s.criteriaValues[i] || 0), 0);
+      let avg = cls.length ? (sum / cls.length).toFixed(2) : "0.00";
+      return avg;
+    });
+
+    // 비고 리스트를 배열로 수집 (최대 maxRemarks개)
+    const remarksList = cls.map(s => s.remark).filter(r => r).slice(0, maxRemarks);
+
+    // 비고가 더 많을 경우를 대비하여 부족한 부분은 빈 문자열로 채움
+    while (remarksList.length < maxRemarks) {
+      remarksList.push("");
+    }
+
+    // 통계 데이터
+    const statsData = [
+      `새${idx + 1}반`,
+      total,
+      menCount,
+      womenCount,
+      ...avgCriteria
+    ];
+
+    // 비고 데이터 결합
+    const rowData = statsData.concat(remarksList);
+
+    // 시트에 데이터 입력
+    sh.getRange(rowStart, 1, 1, rowData.length).setValues([rowData]);
+    rowStart++;
+  });
+
+  // 열 너비 조정
+  sh.setColumnWidths(1, statsHeader.length, 60);
+}
+
+function writeResultSheet2(ss, classes, config) {
+  let sh = ss.getSheetByName("재편성 결과_기존반 정렬");
+  if(sh) { // 시트가 이미 있다면
+    // 시트의 데이터 영역 전체를 clear() 로 지워서 내용과 서식 모두 초기화! ✨
+    sh.getDataRange().clear();
+  } else {
+    let activeSheet = ss.getActiveSheet(); // 현재 활성 시트 저장
+    sh = ss.insertSheet("재편성 결과_기존반 정렬"); // 새 시트 생성! ✨ (이 시트가 잠시 활성 시트가 됨)
+    ss.setActiveSheet(activeSheet); // 다시 원래 활성 시트로 돌아감
+  }
+
+  // 2) classes 배열(새반별)을 1차원으로 펼쳐서
+  //    ( oldClass, newClass, number, name, gender, remark, criteriaValues ) 형태로 재조합
+  let flattened = [];
+  classes.forEach((cls, newClassIndex) => {
+    cls.forEach(student => {
+      flattened.push({
+        oldClass: student.prevClass,            // 옛반 (ex: "1반", "2반")
+        newClass: `새${newClassIndex + 1}반`,   // 새반
+        number:   student.number || "",
+        name:     student.name,
+        gender:   student.gender,
+        remark:   student.remark || "",
+        criteriaValues: student.criteriaValues || []  // <-- 기준값 배열도 보관
+      });
+    });
+  });
+
+  // 3) 정렬: [옛반 → 번호] 순
+  flattened.sort((a, b) => {
+    const aOldNum = parseInt(a.oldClass);
+    const bOldNum = parseInt(b.oldClass);
+
+    if (!isNaN(aOldNum) && !isNaN(bOldNum) && aOldNum !== bOldNum) {
+      // "1반", "2반" 처럼 숫자 부분이 다르면 숫자 비교
+      return aOldNum - bOldNum;
+    } else {
+      // 둘 다 숫자가 아니거나, 같은 숫자면 문자열 비교
+      const oldCompare = a.oldClass.localeCompare(b.oldClass, 'ko');
+      if (oldCompare !== 0) return oldCompare;
+    }
+    // 옛반이 같으면 번호 오름차순
+        return (parseInt(a.number) || 0) - (parseInt(b.number) || 0);
+  });
+
+  // 4) 헤더 작성
+  const headers = ["기존 반", "번호", "이름", "성별", "새 반", "비고"];
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sh.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+
+  // 5) 실제 학생 데이터 출력
+  let row = 2;
+  let prevOldClass = null;
+
+  for (let i = 0; i < flattened.length; i++) {
+    const s = flattened[i];
+
+    // (선택) 옛반이 달라지면 한 줄 띄워주기
+    if (prevOldClass !== null && s.oldClass !== prevOldClass) {
+      row++;
+    }
+
+    sh.getRange(row, 1).setValue(s.oldClass);
+    sh.getRange(row, 2).setValue(s.number);
+    sh.getRange(row, 3).setValue(s.name);
+    sh.getRange(row, 4).setValue(s.gender);
+    sh.getRange(row, 5).setValue(s.newClass);
+    sh.getRange(row, 6).setValue(s.remark);
+
+    prevOldClass = s.oldClass;
+    row++;
+  }
+
+  // === (추가) 아래쪽에 "옛반별 기준 평균(0 제외)" 표시 ===
+
+  // 6) 옛반별로 기준값 누적하기
+  //    예: oldClassStats = {
+  //         "1반": { sums: [합1, 합2, ...], counts: [개수1, 개수2, ...] },
+  //         "2반": { sums: [...], counts: [...] }, ...
+  //       }
+  const numCriteria = config.criteriaNames.length;
+  let oldClassStats = {};
+
+  flattened.forEach(s => {
+    const oc = s.oldClass;
+    if (!oldClassStats[oc]) {
+      oldClassStats[oc] = {
+        sums: Array(numCriteria).fill(0),
+        counts: Array(numCriteria).fill(0)
+      };
+    }
+    s.criteriaValues.forEach((val, idx) => {
+      // 0은 제외하므로 val !== 0일 때만 더함
+      if (val !== 0) {
+        oldClassStats[oc].sums[idx] += val;
+        oldClassStats[oc].counts[idx]++;
+      }
+    });
+  });
+
+  // 7) 통계 섹션 헤더
+  row += 2; // (학생 목록 아래 두 줄 정도 띄우고)
+  sh.getRange(row, 1).setValue("옛반 평균").setFontWeight("bold");
+  row++;
+
+  // 예: ["옛반", "기준1", "기준2", ... ] 형태
+  const statsHeader = ["옛반"].concat(config.criteriaNames);
+  sh.getRange(row, 1, 1, statsHeader.length).setValues([statsHeader]);
+  sh.getRange(row, 1, 1, statsHeader.length).setFontWeight("bold");
+  row++;
+
+  // 8) 옛반 이름 순서대로
+  // 8) 옛반 이름 순서대로 통계 출력
+  const sortedOldClasses = Object.keys(oldClassStats).sort((a, b) => {
+    // "1반", "2반"처럼 숫자 추출해서 비교
+    const aNum = parseInt(a) || 0;
+    const bNum = parseInt(b) || 0;
+    if (aNum !== bNum) return aNum - bNum;
+    return a.localeCompare(b, 'ko');
+  });
+
+  sortedOldClasses.forEach(oc => {
+    const st = oldClassStats[oc]; // { sums: [...], counts: [...] }
+    // 각 기준별 평균(0 제외) 계산
+    const avgArr = st.sums.map((sumVal, idx) => {
+      const cnt = st.counts[idx];
+      if (cnt === 0) return ""; // 혹은 "N/A"
+      return (sumVal / cnt).toFixed(2);
+    });
+
+    // 예: ["1반", 3.50, 2.00, 1.20, ...]
+    const rowData = [oc].concat(avgArr);
+
+    sh.getRange(row, 1, 1, rowData.length).setValues([rowData]);
+    row++;
+  });
+
+  // 9) 스타일 마무리
+  const lastCol = Math.max(headers.length, statsHeader.length);
+  sh.setColumnWidths(1, lastCol, 60);
+  // sh.getRange(1, 1, row, lastCol).setWrap(true);
+  sh.autoResizeRows(1, row);
+}
+
+/*******************************************************
+ * 13-2) **[추가]** 이전 반 - 성별 균형 비용 계산 함수
+ *******************************************************/
+function calculatePrevClassGenderImbalanceCost(classes, config, alphaPrevClassGender) {
+  let cost = 0;
+  const allStudents = config.included; // 배정 대상 학생 목록
+
+  // 1. 전체 학생 성비 계산
+  const totalMaleRatio = allStudents.filter(s => s.gender === "남").length / allStudents.length;
+
+  // 2. 각 새 반, 각 예전 반별 성비 불균형 계산
+  classes.forEach(newClass => {
+    const prevClassGenderRatios = {}; // 예: { "1반": { male: 0.6, female: 0.4 }, "2반": ... }
+
+    // 2.1. 새 반의 학생들을 예전 반별로 그룹화
+    const groupedByPrevClass = {};
+    newClass.forEach(student => {
+      const prevClass = student.prevClass;
+      if (!groupedByPrevClass[prevClass]) {
+        groupedByPrevClass[prevClass] = [];
+      }
+      groupedByPrevClass[prevClass].push(student);
+    });
+
+    // 2.2. 각 예전 반 그룹의 성비 계산 및 불균형 누적
+    for (const prevClass in groupedByPrevClass) {
+      if (groupedByPrevClass.hasOwnProperty(prevClass)) {
+        const studentsInPrevClass = groupedByPrevClass[prevClass];
+        const maleCount = studentsInPrevClass.filter(s => s.gender === "남").length;
+        const femaleCount = studentsInPrevClass.filter(s => s.gender === "여").length;
+        const classTotal = studentsInPrevClass.length;
+
+        if (classTotal > 0) {
+          const classMaleRatio = maleCount / classTotal;
+          cost += alphaPrevClassGender * Math.abs(classMaleRatio - totalMaleRatio); // 불균형 누적
+        }
+      }
+    }
+  });
+
+  return cost;
+}
+
+/*******************************************************
+ * 13-3) **[추가]** 개선된 이전 반 분포 균등성 비용 계산 함수
+ *******************************************************/
+function calculateImprovedOldClassImbalanceCost(classes, config, alphaOldClass) {
+  let totalCost = 0;
+  const oldClasses = config.targetOldClassCounts; // 예: { "1반": [target1, target2, ...], "2반": [...] }
+
+  for (const oldClassName in oldClasses) {
+    if (oldClasses.hasOwnProperty(oldClassName)) {
+      const targetDistribution = oldClasses[oldClassName]; // 목표 분배 (새 반별 학생 수)
+      const classCounts = []; // 각 새 반에 배정된 특정 이전 반 학생 수
+
+      // 각 새 반에 배정된 특정 이전 반 학생 수 카운트
+      for (let i = 0; i < classes.length; i++) {
+        const count = classes[i].filter(s => s.prevClass === oldClassName).length;
+        classCounts.push(count);
+      }
+
+      // 분산 계산: 각 반별 학생 수와 목표 학생 수 차이의 제곱 합
+      let variance = 0;
+      for (let i = 0; i < classes.length; i++) {
+        variance += Math.pow(classCounts[i] - targetDistribution[i], 2);
+      }
+      totalCost += alphaOldClass * variance;
+    }
+  }
+  return totalCost;
+}
+
+/*******************************************************
+ * 14) "분반" 시트 생성 - 메모에 옛반 정보 기록 추가! ✨
+ *******************************************************/
+function createHorizontalBlockSheet_MenTopWomenBottom(ss, classes, currentClassCount, config) {
+  let sheetName = "분반";
+  let sh = ss.getSheetByName(sheetName);
+  if(sh) {
+    // 시트가 이미 있다면 내용과 서식만 clear() 로 초기화
+    sh.getDataRange().clear();
+  } else {
+    // 시트가 없다면 새로 생성
+    sh = ss.insertSheet(sheetName, ss.getNumSheets()+1);
+  }
+
+  const K = classes.length;
+  const oldArr = getAllPrevClasses(ss, currentClassCount);
+  if(!oldArr.length){
+    SpreadsheetApp.getUi().alert("옛반 목록이 비어 있습니다.");
+    return;
+  }
+  const M = oldArr.length;
+  const gap = 1;
+
+  const neededCols = K*(M+gap) + 2; // 실제로 필요한 열 수
+  const maxCols = sh.getMaxColumns();
+
+  // 만약 neededCols > maxCols 이면 부족한 열만큼 추가
+  if (neededCols > maxCols) {
+    sh.insertColumnsAfter(maxCols, neededCols - maxCols);
+  }
+  // 이제 필요한 열이 충분하므로 setColumnWidths 사용
+  sh.setColumnWidths(1, neededCols, 60);
+
+  // 나머지 스타일 (예: 행 높이, 래핑 등)
+  sh.setRowHeights(1, sh.getMaxRows(), 20);
+  // sh.getRange(1,1, sh.getMaxRows(), neededCols).setWrap(true);
+
+  // 각 새반별 남/여 계산 및 옛반별 분류
+  for(let i=0; i<K; i++){
+    const colStart = 1 + i*(M+gap);
+
+    // 남/여 수
+    let menCount = 0, womenCount = 0;
+    classes[i].forEach(st=>{
+      if(st.gender==="남") menCount++;
+      else if(st.gender==="여") womenCount++;
+    });
+    // "새1반" 헤더 + 옆 칸에 "남: x", "여: y"
+    sh.getRange(2, colStart).setValue(`새${i+1}반`).setFontWeight("bold");
+    sh.getRange(2, colStart+1).setValue(`남: ${menCount}`).setFontWeight("bold");
+    sh.getRange(2, colStart+2).setValue(`여: ${womenCount}`).setFontWeight("bold");
+    // 옛반 헤더 (3행) - 메모 추가! ✨
+    for(let j=0; j<M; j++){
+      const oldClassName = oldArr[j]; // 옛반 이름 (예: "1반")
+      sh.getRange(3, colStart+j).setValue(oldClassName).setFontWeight("bold")
+        .setNote(`옛반: ${oldClassName}`); // 메모에 옛반 이름 기록! ✨
+    }
+
+    // 분류 (옛반별 남학생/여학생)
+    const mapOC = {};
+    oldArr.forEach(oc => mapOC[oc] = { men: [], women: [] });
+    classes[i].forEach(st => {
+      if(!mapOC[st.prevClass]) mapOC[st.prevClass] = { men: [], women: [] };
+      if(st.gender==="남") mapOC[st.prevClass].men.push(st);
+      else mapOC[st.prevClass].women.push(st);
+    });
+
+    for(let j=0; j<M; j++){
+      const oc = oldArr[j];
+      const menList = mapOC[oc].men;
+      const womenList = mapOC[oc].women;
+      let rowCur = 4;
+      menList.forEach(st => {
+        let cell = sh.getRange(rowCur, colStart + j);
+        cell.setValue(st.name).setBackground("lightgreen");
+        cell.setNote(
+          `옛반:${st.prevClass}\n` + // 메모에 옛반 정보 기록! ✨
+          `번호:${st.number}\n` +
+          `비고:${st.remark}\n` +
+          config.criteriaNames.map((name, idx) => `${name}:${st.criteriaValues[idx]}`).join("\n")
+        );
+        rowCur++;
+      });
+      womenList.forEach(st => {
+        let cell = sh.getRange(rowCur, colStart + j);
+        cell.setValue(st.name).setBackground("lightyellow");
+        cell.setNote(
+          `옛반:${st.prevClass}\n` + // 메모에 옛반 정보 기록! ✨
+          `번호:${st.number}\n` +
+          `비고:${st.remark}\n` +
+          config.criteriaNames.map((name, idx) => `${name}:${st.criteriaValues[idx]}`).join("\n")
+        );
+        rowCur++;
+      });
+    }
+  }
+
+  // 미배정 학생 처리
+  const { excluded } = config;
+
+  let rowStart = sh.getLastRow() + 4;
+  let rowAvg = sh.getLastRow() + 4;
+  if(excluded && excluded.length){
+    sh.getRange(rowStart,1).setValue("미배정").setFontWeight("bold");
+    rowStart++;
+    excluded.forEach((st,idx)=>{
+      let cell = sh.getRange(rowStart,1);
+      let cell2 = sh.getRange(rowStart,2);
+      cell.setValue(`${st.name}`);
+      cell2.setValue(`${st.prevClass},${st.gender}`);
+      cell.setBackground("#cccccc");
+      cell2.setBackground("#cccccc");
+      cell.setNote(
+        `옛반:${st.prevClass}\n`+ // 메모에 옛반 정보 기록! ✨
+        `비고:${st.remark}\n`+
+        config.criteriaNames.map((name, idx) => `${name}:${st.criteriaValues[idx]}`).join("\n")
+      );
+      rowStart++;
+    });
+  }
+
+  writeOriginalClassStatsNextToMibaejung(sh, config);
+
+  // HBC 하단에 평균표도 작성
+  sh.getRange(rowAvg, 9).setValue("새반 평균").setFontWeight("bold");
+  rowAvg++;
+
+  // 반별 통계 헤더 생성
+  let statsHeader = [
+    "반",
+    "인원",
+    ...config.criteriaNames.map(name => `${name}`)
+  ];
+  let maxRemarks = 0;
+  classes.forEach(cls => {
+    const remarksCount = cls.map(s => s.remark).filter(r => r).length;
+    if (remarksCount > maxRemarks) maxRemarks = remarksCount;
+  });
+  maxRemarks = Math.min(maxRemarks, 10); // 필요에 따라 조정 가능
+
+  for (let i = 1; i <= maxRemarks; i++) {
+    statsHeader.push(`비고${i}`);
+  }
+
+  sh.getRange(rowAvg, 9, 1, statsHeader.length).setValues([statsHeader]);
+  sh.getRange(rowAvg, 9, 1, statsHeader.length).setFontWeight("bold");
+  rowAvg++;
+
+  // 각 반의 통계 및 비고 리스트 작성
+  classes.forEach((cls, idx) => {
+    const total = cls.length;
+    const avgCriteria = config.criteriaNames.map((metric, i) => {
+      let sum = cls.reduce((acc, s) => acc + (s.criteriaValues[i] || 0), 0);
+      let avg = cls.length ? (sum / cls.length).toFixed(2) : "0.00";
+      return avg;
+    });
+
+    // 비고 리스트를 배열로 수집 (최대 maxRemarks개)
+    const remarksList = cls.map(s => s.remark).filter(r => r).slice(0, maxRemarks);
+
+    // 비고가 더 많을 경우를 대비하여 부족한 부분은 빈 문자열로 채움
+    while (remarksList.length < maxRemarks) {
+      remarksList.push("");
+    }
+
+    // 통계 데이터
+    const statsData = [
+      `새${idx + 1}반`,
+      total,
+      ...avgCriteria
+    ];
+
+    // 비고 데이터 결합
+    const rowData = statsData.concat(remarksList);
+
+    // 시트에 데이터 입력
+    sh.getRange(rowAvg, 9, 1, rowData.length).setValues([rowData]);
+    rowAvg++;
+  });
+
+  // 열 너비 조정
+  sh.setColumnWidths(1, statsHeader.length, 60);
+
+  // 텍스트 래핑 설정
+  // sh.getRange(1, 1, sh.getMaxRows(), statsHeader.length).setWrap(true);
+}
+
+/*******************************************************
+ * 16) writeOriginalClassStatsNextToMibaejung 함수 (재추가!)
+ *******************************************************/
+function writeOriginalClassStatsNextToMibaejung(sh, config) {
+  // 1) '미배정' 위치 찾기 (A열)
+  const lastRow = sh.getLastRow();
+  let rowMi = null;
+
+  for (let r = 1; r <= lastRow; r++) {
+    const val = String(sh.getRange(r, 1).getValue() || "").trim();
+    if (val.indexOf("미배정") >= 0) { // '미배정' 포함 여부 확인
+      rowMi = r;
+      break;
+    }
+  }
+
+  if (!rowMi) {
+    Logger.log("미배정 라벨을 찾지 못했습니다.");
+    return;
+  }
+
+  // 2) 전학/특수 제외한 학생들로 각 반 인원수 계산
+  const stats = getOriginalClassStats(config); // 아래에서 정의한 함수 사용
+
+  // 3) 미배정 행 바로 아래 행부터 (rowMi + 1) 에 반별 인원수 작성
+  let rowStart = rowMi + 1; // 미배정 다음 *다음* 행부터 시작하도록 변경
+  let colClassName = 4; // D열로 수정 (C열은 '미배정' 정보)
+  let colTotal = 5;      // E열
+  let colMen = 6;        // F열
+  let colWomen = 7;      // G열
+
+  // **[추가] 헤더 작성: 미배정 바로 다음 행 (rowMi + 1)**
+  sh.getRange(rowMi , colClassName).setValue("기존반").setFontWeight("bold");
+  sh.getRange(rowMi , colTotal).setValue("인원").setFontWeight("bold");
+  sh.getRange(rowMi , colMen).setValue("남").setFontWeight("bold");
+  sh.getRange(rowMi , colWomen).setValue("여").setFontWeight("bold");
+
+
+  // 반 이름을 오름차순으로 정렬
+  const classNames = Object.keys(stats).sort((a, b) => {
+    // "1반", "2반" 등 숫자 순으로 정렬
+    const numA = parseInt(a);
+    const numB = parseInt(b);
+    return numA - numB;
+  });
+
+  classNames.forEach((cn) => {
+    const info = stats[cn]; // { total, men, women }
+
+    // D열: 반 이름
+    sh.getRange(rowStart, colClassName).setValue(cn).setFontWeight("bold");
+
+    // E열: 인원수 (숫자만)
+    sh.getRange(rowStart, colTotal).setValue(info.total); // 숫자만 입력
+
+    // F열: 남학생 수 (숫자만)
+    sh.getRange(rowStart, colMen).setValue(info.men);   // 숫자만 입력
+
+    // G열: 여학생 수 (숫자만)
+    sh.getRange(rowStart, colWomen).setValue(info.women); // 숫자만 입력
+
+    // 다음 반으로 이동 (다음 행)
+    rowStart++;
+  });
+}
+
+/*******************************************************
+ * 15) 갱신하기: 수동 편집한 분반 시트에서,
+ * '미배정' 직전 행까지 모든 열을 스캔하고,
+ * '재편성 결과' 시트도 동일하게 업데이트
+ *******************************************************/
+function updateHBCwithAverages() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shHBC = ss.getSheetByName("분반");
+  if (!shHBC) {
+    SpreadsheetApp.getUi().alert("분반 시트가 없습니다.");
+    return;
+  }
+
+  // 1) "미배정"이 있는 행 찾기 (A열 기준)
+  const columnA = shHBC.getRange("A:A").getValues().flat();
+  let miRow = null;
+  let rowAvg = null;
+  for (let r = 1; r <= columnA.length; r++) { // 1-based 인덱스
+    if (String(columnA[r - 1] || "").trim() === "미배정") {
+      rowAvg = r;
+      miRow = r;
+      break;
+    }
+  }
+  if (!miRow) {
+    SpreadsheetApp.getUi().alert("A열에 '미배정' 행이 없습니다.");
+    return;
+  }
+
+  // 2) 새반 헤더 파악 (2행)
+  const rowNewClass = 2;
+  const newClassVals = shHBC.getRange(rowNewClass, 1, 1, shHBC.getLastColumn()).getValues()[0];
+  let newClassInfo = [];
+  for (let c = 0; c < newClassVals.length; c++) {
+    const v = String(newClassVals[c] || "").trim();
+    if (!v) continue;
+    let m = v.match(/^새(\d+)반$/);
+    if (m) {
+      let idx = Number(m[1]) - 1;
+      newClassInfo.push({ newClassIndex: idx, colStart: c + 1 });
+    }
+  }
+  if (!newClassInfo.length) {
+    SpreadsheetApp.getUi().alert("2행에 '새X반' 헤더가 없습니다.");
+    return;
+  }
+  const K = newClassInfo.length;
+
+  // 3) 옛반 헤더 파악 (3행)
+  const rowOldClass = 3;
+  const oldRowVals = shHBC.getRange(rowOldClass, 1, 1, shHBC.getLastColumn()).getValues()[0];
+  let M = 0;
+  for (let c = 0; c < oldRowVals.length; c++) {
+    if (!String(oldRowVals[c] || "").trim()) break;
+    M++;
+  }
+  if (!M) {
+    SpreadsheetApp.getUi().alert("3행에 옛반 헤더가 없습니다.");
+    return;
+  }
+
+  // 4) 설정 시트에서 기준 이름 읽기
+  const config = readConfig(ss);
+  if (!config) {
+    SpreadsheetApp.getUi().alert("config 시트를 찾을 수 없거나, 설정값이 잘못되었습니다.");
+    return;
+  }
+  const criteriaNames = config.criteriaNames;
+
+  // 5) 실제 학생 스캔 (4행부터 miRow -1 행까지)
+  const classes = Array.from({ length: K }, () => []);
+  const studentMap = new Map(); // 학생 식별을 위한 Map (이름 + 옛반 → 학생 객체)
+
+  for (let i = 0; i < K; i++) {
+    const startCol = newClassInfo[i].colStart;
+    for (let c = startCol; c < startCol + M; c++) {
+      if (c > shHBC.getLastColumn()) break;
+      for (let r = 4; r < miRow; r++) { // '미배정' 직전 행까지
+        let nameVal = String(shHBC.getRange(r, c).getValue() || "").trim();
+        if (!nameVal) {
+          // 빈칸은 무시하고 계속
+          continue;
+        }
+
+        // getNote, parse
+        let cell = shHBC.getRange(r, c);
+        let note = cell.getNote();
+        let stInfo = parseNoteForStats(note, criteriaNames);
+        const prevClass = stInfo.prevClass || String(oldRowVals[c - 1] || "").trim(); // 메모에 없으면 헤더에서
+
+        // 배경색으로 성별 판별
+        let bg = cell.getBackground().toLowerCase();
+        let gender = "여"; // 기본값
+        if (bg.includes("#90ee90") || bg.includes("144,238,144")) { // lightgreen
+          gender = "남";
+        }
+
+        const student = {
+          name: nameVal,
+          gender: gender,
+          prevClass: prevClass,
+          remark: stInfo.remark || "",
+          criteriaValues: stInfo.criteriaValues || [],
+          number: stInfo.number || ""
+        };
+        classes[i].push(student);
+
+        // 학생 맵에 추가 (항상 메모-옛반 정보 기준으로 키 생성)
+        const studentKey = `${student.name}_${student.prevClass}`; // 항상 메모 기반 키 사용
+        studentMap.set(studentKey, student);
+      }
+    }
+  }
+
+  // 6) 남/여 인원 + HBC 헤더 수정
+  for (let i = 0; i < K; i++) {
+    let menCnt = classes[i].filter(s => s.gender === "남").length;
+    let womenCnt = classes[i].filter(s => s.gender === "여").length;
+    let colStart = newClassInfo[i].colStart;
+
+    // "새X반" 헤더
+    shHBC.getRange(2, colStart).setValue(`새${i + 1}반`).setFontWeight("bold");
+    // "남: x"
+    shHBC.getRange(2, colStart + 1).setValue(`남: ${menCnt}`).setFontWeight("bold");
+    // "여: y"
+    shHBC.getRange(2, colStart + 2).setValue(`여: ${womenCnt}`).setFontWeight("bold");
+  }
+
+  // 7) HBC 하단 평균 및 비고 리스트 추가
+  clearOldAverageTable(shHBC, "새반 평균", rowAvg);
+  shHBC.getRange(rowAvg, 9).setValue("새반 평균").setFontWeight("bold");
+  rowAvg++;
+
+  // 반별 통계 헤더 생성
+  let statsHeader = [
+    "반",
+    "인원",
+    ...criteriaNames.map(name => `${name}`)
+  ];
+  let maxRemarks = 0;
+  classes.forEach(cls => {
+    const remarksCount = cls.map(s => s.remark).filter(r => r).length;
+    if (remarksCount > maxRemarks) maxRemarks = remarksCount;
+  });
+  maxRemarks = Math.min(maxRemarks, 10); // 필요에 따라 조정 가능
+
+  for (let i = 1; i <= maxRemarks; i++) {
+    statsHeader.push(`비고${i}`);
+  }
+
+  shHBC.getRange(rowAvg, 9, 1, statsHeader.length).setValues([statsHeader]);
+  shHBC.getRange(rowAvg, 9, 1, statsHeader.length).setFontWeight("bold");
+  rowAvg++;
+
+  // 각 반의 통계 및 비고 리스트 작성
+  classes.forEach((cls, idx) => {
+    const total = cls.length;
+    const avgCriteria = criteriaNames.map((metric, i) => {
+      let sum = cls.reduce((acc, s) => acc + (s.criteriaValues[i] || 0), 0);
+      let avg = cls.length ? (sum / cls.length).toFixed(2) : "0.00";
+      return avg;
+    });
+
+    // 비고 리스트를 배열로 수집 (최대 maxRemarks개)
+    const remarksList = cls.map(s => s.remark).filter(r => r).slice(0, maxRemarks);
+
+    // 비고가 더 많을 경우를 대비하여 부족한 부분은 빈 문자열로 채움
+    while (remarksList.length < maxRemarks) {
+      remarksList.push("");
+    }
+
+    // 통계 데이터
+    const statsData = [
+      `새${idx + 1}반`,
+      total,
+      ...avgCriteria
+    ];
+
+    // 비고 데이터 결합
+    const rowData = statsData.concat(remarksList);
+
+    // 시트에 데이터 입력
+    shHBC.getRange(rowAvg, 9, 1, rowData.length).setValues([rowData]);
+    rowAvg++;
+  });
+
+  // 열 너비 조정
+  shHBC.setColumnWidths(1, statsHeader.length, 60);
+
+  // 텍스트 래핑 설정
+  // shHBC.getRange(1, 1, shHBC.getMaxRows(), statsHeader.length).setWrap(true);
+
+  // 8) "재편성 결과" 시트 업데이트
+  writeResultSheet(ss, classes, config);
+  // ** 추가: "재편성 결과_2" 시트도 업데이트 **
+  writeResultSheet2(ss, classes, config);
+}
+
+/*******************************************************
+ * 17) parseNoteForStats (동적 기준 + 번호 + 옛반 지원) - 수정! ✨
+ *******************************************************/
+function parseNoteForStats(noteText, criteriaNames) {
+  if (!noteText) return {};
+  const info = { criteriaValues: [], number: "", prevClass: "", remark: "" }; // remark 추가! ✨
+  let lines = noteText.split("\n");
+
+  // 초기화
+  criteriaNames.forEach(() => {
+    info.criteriaValues.push(0);
+  });
+
+  lines.forEach(line => {
+    let parts = line.split(":");
+    if (parts.length < 2) return;
+    let key = parts[0].trim();
+    let val = parts.slice(1).join(":").trim();
+
+    // 1) 번호
+    if (key.includes("번호")) {
+      info.number = val;  // parseInt(val) 해도 되고, 문자열 그대로 해도 됩니다
+      return;
+    }
+
+    // 2) 기준
+    const criteriaIndex = criteriaNames.findIndex(name => key.includes(name));
+    if (criteriaIndex !== -1) {
+      info.criteriaValues[criteriaIndex] = Number(val) || 0;
+    }
+    // 3) 비고
+    else if (key.includes("비고")) {
+      info.remark = val;
+    }
+    // 4) 옛반 (추가! ✨)
+    else if (key.includes("옛반")) {
+      info.prevClass = val;
+      return;
+    }
+     // 5) Remark (비고와 Remark 둘 다 처리) - "비고" 키워드가 없을 때도 처리
+    else {
+      if (key !== "옛반" && key !== "번호" && criteriaNames.findIndex(name => key.includes(name)) === -1) {
+        info.remark += (info.remark ? "\n" : "") + line; // 기존 비고 내용에 추가 (줄바꿈 유지)
+      }
+    }
+  });
+  return info;
+}
+
+/*******************************************************
+ * 18) getAllPrevClasses
+ *******************************************************/
+function getAllPrevClasses(ss, currentClassCount) {
+  const names = [];
+  for(let i=1; i<=currentClassCount; i++){
+    const sn = i + "반";
+    let sh = ss.getSheetByName(sn);
+    if(sh) names.push(sn);
+  }
+  return names;
+}
+
+/*******************************************************
+ * 19) getOriginalClassStats
+ *******************************************************/
+function getOriginalClassStats(config) {
+  const included = config.included; // 전학/특수 제외된 전체 학생 목록
+  const currentClassCount = config.currentClassCount;
+
+  // 초기화
+  let stats = {};
+  for (let i = 1; i <= currentClassCount; i++) {
+    let cn = i + "반";
+    stats[cn] = { total: 0, men: 0, women: 0 };
+  }
+
+  // 학생 목록 순회하여 각 반 인원수 집계
+  included.forEach(s => {
+    let oc = s.prevClass; // "1반", "2반", ...
+    if (!stats[oc]) {
+      // 만약 config.currentClassCount보다 더 많은 반이 있다면 초기화
+      stats[oc] = { total: 0, men: 0, women: 0 };
+    }
+    stats[oc].total++;
+    if (s.gender === "남") stats[oc].men++;
+    else if (s.gender === "여") stats[oc].women++;
+  });
+
+  return stats;
+}
+
+/*******************************************************
+ * 20) clearOldAverageTable
+ *******************************************************/
+function clearOldAverageTable(sh, titleString, lastRow) {
+  for (let r = 1; r <= lastRow+3; r++) {
+    let v = String(sh.getRange(r, 9).getValue() || "").trim();
+    if (v === titleString) {
+      sh.getRange(r, 9, 10, 20).clearContent(); // 충분히 넓은 범위로 수정
+      break;
+    }
+  }
+}
+
+/*******************************************************
+ * 21) getSizeVariance 함수 추가
+ *******************************************************/
+function getSizeVariance(classes, classSizeLimits) {
+  let variance = 0;
+  classes.forEach((cls, idx) => {
+    const expected = classSizeLimits[idx];
+    const actual = cls.length;
+    const diff = actual - expected;
+    variance += diff * diff;
+  });
+  return variance;
+}
