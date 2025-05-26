@@ -152,15 +152,15 @@ function readConfig(ss) {
     return null;
   }
 
-  let currentClassCount = Number(configClassSheet.getRange("A1").getValue());
+  let currentClassCount = Number(configClassSheet.getRange("B1").getValue());
   if (isNaN(currentClassCount) || currentClassCount <= 0 || !Number.isInteger(currentClassCount)) {
-    ui.alert(CONSTANTS.MESSAGES.CONFIG_INVALID_VALUE(CONSTANTS.SHEET_NAMES.CONFIG_CLASS, "A1", "현재 학급 수는 양의 정수여야 합니다. (기본값: 4)"));
+    ui.alert(CONSTANTS.MESSAGES.CONFIG_INVALID_VALUE(CONSTANTS.SHEET_NAMES.CONFIG_CLASS, "B1", "현재 학급 수는 양의 정수여야 합니다. (기본값: 4)"));
     currentClassCount = CONSTANTS.DEFAULT_VALUES.CURRENT_CLASS_COUNT; // 기본값 사용 또는 null 반환 결정 필요
   }
 
-  let targetClassCount = Number(configClassSheet.getRange("A2").getValue());
+  let targetClassCount = Number(configClassSheet.getRange("B2").getValue());
   if (isNaN(targetClassCount) || targetClassCount <= 0 || !Number.isInteger(targetClassCount)) {
-    ui.alert(CONSTANTS.MESSAGES.CONFIG_INVALID_VALUE(CONSTANTS.SHEET_NAMES.CONFIG_CLASS, "A2", "목표 학급 수는 양의 정수여야 합니다. (기본값: 4)"));
+    ui.alert(CONSTANTS.MESSAGES.CONFIG_INVALID_VALUE(CONSTANTS.SHEET_NAMES.CONFIG_CLASS, "B2", "목표 학급 수는 양의 정수여야 합니다. (기본값: 4)"));
     targetClassCount = CONSTANTS.DEFAULT_VALUES.TARGET_CLASS_COUNT;
   }
 
